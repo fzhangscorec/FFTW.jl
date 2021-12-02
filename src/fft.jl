@@ -457,50 +457,51 @@ _colmajorstrides(p) = ()
 # Execute
 
 unsafe_execute!(plan::FFTWPlan{<:fftwDouble}) =
-    ccall((:fftw_execute,libfftw3[]), Cvoid, (PlanPtr,), plan)
+    plan.plan != C_NULL && ccall((:fftw_execute,libfftw3[]), Cvoid, (PlanPtr,), plan)
 
 unsafe_execute!(plan::FFTWPlan{<:fftwSingle}) =
-    ccall((:fftwf_execute,libfftw3f[]), Cvoid, (PlanPtr,), plan)
+    plan.plan != C_NULL && ccall((:fftwf_execute,libfftw3f[]), Cvoid, (PlanPtr,), plan)
 
 unsafe_execute!(plan::cFFTWPlan{T},
                 X::StridedArray{T}, Y::StridedArray{T}) where {T<:fftwDouble} =
-    ccall((:fftw_execute_dft,libfftw3[]), Cvoid,
+    plan.plan != C_NULL && ccall((:fftw_execute_dft,libfftw3[]), Cvoid,
           (PlanPtr,Ptr{T},Ptr{T}), plan, X, Y)
 
 unsafe_execute!(plan::cFFTWPlan{T},
                 X::StridedArray{T}, Y::StridedArray{T}) where {T<:fftwSingle} =
-    ccall((:fftwf_execute_dft,libfftw3f[]), Cvoid,
+    plan.plan != C_NULL && ccall((:fftwf_execute_dft,libfftw3f[]), Cvoid,
           (PlanPtr,Ptr{T},Ptr{T}), plan, X, Y)
 
 unsafe_execute!(plan::rFFTWPlan{Float64,FORWARD},
                 X::StridedArray{Float64}, Y::StridedArray{Complex{Float64}}) =
-    ccall((:fftw_execute_dft_r2c,libfftw3[]), Cvoid,
+    plan.plan != C_NULL && ccall((:fftw_execute_dft_r2c,libfftw3[]), Cvoid,
           (PlanPtr,Ptr{Float64},Ptr{Complex{Float64}}), plan, X, Y)
 
 unsafe_execute!(plan::rFFTWPlan{Float32,FORWARD},
                 X::StridedArray{Float32}, Y::StridedArray{Complex{Float32}}) =
-    ccall((:fftwf_execute_dft_r2c,libfftw3f[]), Cvoid,
+    plan.plan != C_NULL && ccall((:fftwf_execute_dft_r2c,libfftw3f[]), Cvoid,
           (PlanPtr,Ptr{Float32},Ptr{Complex{Float32}}), plan, X, Y)
 
 unsafe_execute!(plan::rFFTWPlan{Complex{Float64},BACKWARD},
                 X::StridedArray{Complex{Float64}}, Y::StridedArray{Float64}) =
-    ccall((:fftw_execute_dft_c2r,libfftw3[]), Cvoid,
+    plan.plan != C_NULL && ccall((:fftw_execute_dft_c2r,libfftw3[]), Cvoid,
           (PlanPtr,Ptr{Complex{Float64}},Ptr{Float64}), plan, X, Y)
 
 unsafe_execute!(plan::rFFTWPlan{Complex{Float32},BACKWARD},
                 X::StridedArray{Complex{Float32}}, Y::StridedArray{Float32}) =
-    ccall((:fftwf_execute_dft_c2r,libfftw3f[]), Cvoid,
+    plan.plan != C_NULL && ccall((:fftwf_execute_dft_c2r,libfftw3f[]), Cvoid,
           (PlanPtr,Ptr{Complex{Float32}},Ptr{Float32}), plan, X, Y)
 
 unsafe_execute!(plan::r2rFFTWPlan{T},
                 X::StridedArray{T}, Y::StridedArray{T}) where {T<:fftwDouble} =
-    ccall((:fftw_execute_r2r,libfftw3[]), Cvoid,
+    plan.plan != C_NULL && plan.plan != C_NULL && ccall((:fftw_execute_r2r,libfftw3[]), Cvoid,
           (PlanPtr,Ptr{T},Ptr{T}), plan, X, Y)
 
 unsafe_execute!(plan::r2rFFTWPlan{T},
                 X::StridedArray{T}, Y::StridedArray{T}) where {T<:fftwSingle} =
-    ccall((:fftwf_execute_r2r,libfftw3f[]), Cvoid,
+    plan.plan != C_NULL && ccall((:fftwf_execute_r2r,libfftw3f[]), Cvoid,
           (PlanPtr,Ptr{T},Ptr{T}), plan, X, Y)
+
 
 # NOTE ON GC (garbage collection):
 #    The FFTWPlan has a finalizer so that gc will destroy the plan,
@@ -514,7 +515,20 @@ unsafe_execute!(plan::r2rFFTWPlan{T},
 
 # Compute dims and howmany for FFTW guru planner
 function dims_howmany(X::StridedArray, Y::StridedArray,
-                      sz::Array{Int,1}, region)
+                      sz::Array{Int,1}, region) :: Tuple{Matrix, Matrix}
+    function array_continues(A::StridedArray)
+        st = strides(A)
+        if length(st)>1 && st[1] != 1
+            return false
+        end
+        sz = size(A)
+        for i in 2:length(sz)
+            if st[i] != st[i-1] * sz[i-1]
+                return false
+            end
+        end
+        return true
+    end
     reg = Int[region...]
     if length(unique(reg)) < length(reg)
         throw(ArgumentError("each dimension can be transformed at most once"))
@@ -526,9 +540,17 @@ function dims_howmany(X::StridedArray, Y::StridedArray,
     oreg[reg] .= 0
     oreg = filter(d -> d > 0, oreg)
     howmany = Matrix(transpose([sz[oreg] ist[oreg] ost[oreg]]))
+    if !isempty(oreg) && array_continues(X) && array_continues(Y)
+        if minimum(reg) == 1 || maximum(reg) == length(ist)
+            axis = minimum(oreg)
+            howmany = transpose([prod(howmany[1,:]) ist[axis] ost[axis]])
+        end
+    end
+    if FFTW.get_provider() == "mkl"
+        @assert size(howmany,2) <= 1 "mkl only supports FFT with dims = 1 or size(A)[end]"
+    end
     return (dims, howmany)
 end
-
 # check & convert kinds into int32 array with same length as region
 function fix_kinds(region, kinds)
     if length(kinds) != length(region)
@@ -565,15 +587,19 @@ for (Tr,Tc,fftw,lib) in ((:Float64,:(Complex{Float64}),"fftw",:libfftw3),
         unsafe_set_timelimit($Tr, timelimit)
         R = isa(region, Tuple) ? region : copy(region)
         dims, howmany = dims_howmany(X, Y, [size(X)...], R)
-        plan = ccall(($(string(fftw,"_plan_guru64_dft")),$lib[]),
-                     PlanPtr,
-                     (Int32, Ptr{Int}, Int32, Ptr{Int},
-                      Ptr{$Tc}, Ptr{$Tc}, Int32, UInt32),
-                     size(dims,2), dims, size(howmany,2), howmany,
-                     X, Y, direction, flags)
-        unsafe_set_timelimit($Tr, NO_TIMELIMIT)
-        if plan == C_NULL
-            error("FFTW could not create plan") # shouldn't normally happen
+        if !isempty(X)
+            plan = ccall(($(string(fftw,"_plan_guru64_dft")),$lib[]),
+                         PlanPtr,
+                         (Int32, Ptr{Int}, Int32, Ptr{Int},
+                          Ptr{$Tc}, Ptr{$Tc}, Int32, UInt32),
+                        size(dims,2), dims, size(howmany,2), howmany,
+                        X, Y, direction, flags)
+            unsafe_set_timelimit($Tr, NO_TIMELIMIT)
+            if plan == C_NULL
+                error("FFTW could not create plan") # shouldn't normally happen
+            end
+        else
+            plan = PlanPtr(C_NULL)
         end
         return cFFTWPlan{$Tc,K,inplace,N}(plan, flags, R, X, Y)
     end
@@ -585,15 +611,19 @@ for (Tr,Tc,fftw,lib) in ((:Float64,:(Complex{Float64}),"fftw",:libfftw3),
         region = circshift(Int[region...],-1) # FFTW halves last dim
         unsafe_set_timelimit($Tr, timelimit)
         dims, howmany = dims_howmany(X, Y, [size(X)...], region)
-        plan = ccall(($(string(fftw,"_plan_guru64_dft_r2c")),$lib[]),
-                     PlanPtr,
-                     (Int32, Ptr{Int}, Int32, Ptr{Int},
-                      Ptr{$Tr}, Ptr{$Tc}, UInt32),
-                     size(dims,2), dims, size(howmany,2), howmany,
-                     X, Y, flags)
-        unsafe_set_timelimit($Tr, NO_TIMELIMIT)
-        if plan == C_NULL
-            error("FFTW could not create plan") # shouldn't normally happen
+        if !isempty(X)
+            plan = ccall(($(string(fftw,"_plan_guru64_dft_r2c")),$lib[]),
+                        PlanPtr,
+                        (Int32, Ptr{Int}, Int32, Ptr{Int},
+                        Ptr{$Tr}, Ptr{$Tc}, UInt32),
+                        size(dims,2), dims, size(howmany,2), howmany,
+                        X, Y, flags)
+            unsafe_set_timelimit($Tr, NO_TIMELIMIT)
+            if plan == C_NULL
+                error("FFTW could not create plan") # shouldn't normally happen
+            end
+        else
+            plan = PlanPtr(C_NULL)
         end
         return rFFTWPlan{$Tr,$FORWARD,inplace,N}(plan, flags, R, X, Y)
     end
@@ -605,15 +635,19 @@ for (Tr,Tc,fftw,lib) in ((:Float64,:(Complex{Float64}),"fftw",:libfftw3),
         region = circshift(Int[region...],-1) # FFTW halves last dim
         unsafe_set_timelimit($Tr, timelimit)
         dims, howmany = dims_howmany(X, Y, [size(Y)...], region)
-        plan = ccall(($(string(fftw,"_plan_guru64_dft_c2r")),$lib[]),
-                     PlanPtr,
-                     (Int32, Ptr{Int}, Int32, Ptr{Int},
-                      Ptr{$Tc}, Ptr{$Tr}, UInt32),
-                     size(dims,2), dims, size(howmany,2), howmany,
-                     X, Y, flags)
-        unsafe_set_timelimit($Tr, NO_TIMELIMIT)
-        if plan == C_NULL
-            error("FFTW could not create plan") # shouldn't normally happen
+        if !isempty(X)
+            plan = ccall(($(string(fftw,"_plan_guru64_dft_c2r")),$lib[]),
+                        PlanPtr,
+                         (Int32, Ptr{Int}, Int32, Ptr{Int},
+                          Ptr{$Tc}, Ptr{$Tr}, UInt32),
+                        size(dims,2), dims, size(howmany,2), howmany,
+                        X, Y, flags)
+            unsafe_set_timelimit($Tr, NO_TIMELIMIT)
+            if plan == C_NULL
+                error("FFTW could not create plan") # shouldn't normally happen
+            end
+        else
+            plan = PlanPtr(C_NULL)
         end
         return rFFTWPlan{$Tc,$BACKWARD,inplace,N}(plan, flags, R, X, Y)
     end
@@ -626,15 +660,19 @@ for (Tr,Tc,fftw,lib) in ((:Float64,:(Complex{Float64}),"fftw",:libfftw3),
         knd = fix_kinds(region, kinds)
         unsafe_set_timelimit($Tr, timelimit)
         dims, howmany = dims_howmany(X, Y, [size(X)...], region)
-        plan = ccall(($(string(fftw,"_plan_guru64_r2r")),$lib[]),
-                     PlanPtr,
-                     (Int32, Ptr{Int}, Int32, Ptr{Int},
-                      Ptr{$Tr}, Ptr{$Tr}, Ptr{Int32}, UInt32),
-                     size(dims,2), dims, size(howmany,2), howmany,
-                     X, Y, knd, flags)
-        unsafe_set_timelimit($Tr, NO_TIMELIMIT)
-        if plan == C_NULL
-            error("FFTW could not create plan") # shouldn't normally happen
+        if !isempty(X)
+            plan = ccall(($(string(fftw,"_plan_guru64_r2r")),$lib[]),
+                        PlanPtr,
+                        (Int32, Ptr{Int}, Int32, Ptr{Int},
+                        Ptr{$Tr}, Ptr{$Tr}, Ptr{Int32}, UInt32),
+                        size(dims,2), dims, size(howmany,2), howmany,
+                        X, Y, knd, flags)
+            unsafe_set_timelimit($Tr, NO_TIMELIMIT)
+            if plan == C_NULL
+                error("FFTW could not create plan") # shouldn't normally happen
+            end
+        else
+            plan = PlanPtr(C_NULL)
         end
         r2rFFTWPlan{$Tr,(map(Int,knd)...,),inplace,N}(plan, flags, R, X, Y)
     end
@@ -651,15 +689,19 @@ for (Tr,Tc,fftw,lib) in ((:Float64,:(Complex{Float64}),"fftw",:libfftw3),
         dims[2:3, 1:size(dims,2)] *= 2
         howmany[2:3, 1:size(howmany,2)] *= 2
         howmany = [howmany [2,1,1]] # append loop over real/imag parts
-        plan = ccall(($(string(fftw,"_plan_guru64_r2r")),$lib[]),
-                     PlanPtr,
-                     (Int32, Ptr{Int}, Int32, Ptr{Int},
-                      Ptr{$Tc}, Ptr{$Tc}, Ptr{Int32}, UInt32),
-                     size(dims,2), dims, size(howmany,2), howmany,
-                     X, Y, knd, flags)
-        unsafe_set_timelimit($Tr, NO_TIMELIMIT)
-        if plan == C_NULL
-            error("FFTW could not create plan") # shouldn't normally happen
+        if !isempty(X)
+            plan = ccall(($(string(fftw,"_plan_guru64_r2r")),$lib[]),
+                         PlanPtr,
+                         (Int32, Ptr{Int}, Int32, Ptr{Int},
+                          Ptr{$Tc}, Ptr{$Tc}, Ptr{Int32}, UInt32),
+                        size(dims,2), dims, size(howmany,2), howmany,
+                        X, Y, knd, flags)
+            unsafe_set_timelimit($Tr, NO_TIMELIMIT)
+            if plan == C_NULL
+                error("FFTW could not create plan") # shouldn't normally happen
+            end
+        else
+            plan = PlanPtr(C_NULL)
         end
         r2rFFTWPlan{$Tc,(map(Int,knd)...,),inplace,N}(plan, flags, R, X, Y)
     end
